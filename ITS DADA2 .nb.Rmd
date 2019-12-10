@@ -1,0 +1,182 @@
+---
+title: "ITS processing pipeline"
+subtitle: "Written by Gordon Custer"
+output: html_notebook
+---
+
+# You can ignore this section unless you are curious about the individual steps in processing. 
+This data is analyzed by the Dada2 pipeline and subsequent analysis in phyloseq and DeSeq2.
+
+Dada2
+https://benjjneb.github.io/dada2/tutorial.html
+https://benjjneb.github.io/dada2/ITS_workflow.html
+
+Phylseq
+https://www.bioconductor.org/packages/devel/bioc/vignettes/phyloseq/inst/doc/phyloseq-analysis.html
+
+DeSeq2 (Diffferential abundance analysis)
+https://www.bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+```{r}
+library(dada2); packageVersion("dada2")
+library(ShortRead)
+```
+Set pathway to files. 
+```{r}
+path <- ""  ## CHANGE ME to the directory containing the fastq files.
+list.files(path)
+```
+
+Split reads into forward and reverse reads. The pattern should match the end of each read. If individual files are unizpped remove the ".gz".
+```{r}
+fnFs <- sort(list.files(path, pattern = "R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "R2_001.fastq.gz", full.names = TRUE))
+```
+
+Now we look for primers and remove them if we find any. Below are the ITS primers used in Custer et al. 2019. 
+```{r}
+FWD <- "GTGARTCATCGAATCTTTG"  ## CHANGE ME to your forward primer sequence
+REV <- "TCCTCCGCTTATTGATATGC"  ## CHANGE ME...
+```
+
+Now, we take all orients of the primers and search for them. 
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+Put N-filterd files in filtN/ subdirectory.
+```{r}
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) # 
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+test<-filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE)
+```
+
+Now we count how many times the primers appear in our reads. 
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+```
+
+If primers were found we would need to remove primers via cutadapt. You must install cutadapt first and show your machine where to find it.
+```{r}
+cutadapt <- "/Users/gordoncuster/.local/bin/cutadapt" # CHANGE ME to the cutadapt path on your machine
+system2(cutadapt, args = "--version") # Run shell commands from R
+```
+
+We now create output filenames for the cutadapt-ed files, and define the parameters we are going to give the cutadapt command. The critical parameters are the primers, and they need to be in the right orientation, i.e. the FWD primer should have been matching the forward-reads in its forward orientation, and the REV primer should have been matching the reverse-reads in its forward orientation. Warning: A lot of output will be written to the screen by cutadapt!
+```{r}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+# Run Cutadapt
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2, # -n 2 required to remove FWD and REV from reads
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs.filtN[i], fnRs.filtN[i])) # input files
+}
+```
+
+Now we check to make sure there are no primers found in our reads. If none are found we can move forward. 
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
+
+The primer-free sequence files are now ready to be analyzed through the DADA2 pipeline. Similar to the earlier steps of reading in FASTQ files, we read in the names of the cutadapt-ed FASTQ files and applying some string manipulation to get the matched lists of forward and reverse fastq files.
+```{r}
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "R1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "R2_001.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format:
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][1]
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+Check quality of samples again by plotting.
+```{r}
+plotQualityProfile(cutFs[1:5])
+plotQualityProfile(cutRs[1:5])
+```
+
+Assigning the filenames for the output of the filtered reads to be stored as fastq.gz files.
+```{r}
+filtFs <- file.path(path.cut, "filtered", basename(cutFs))
+filtRs <- file.path(path.cut, "filtered", basename(cutRs))
+```
+
+Next, we filter and trim based on the read characteristics including expected errors, minimum length and quality score. You never want to trim by soley length with ITS reads due to the variabilty in the ITS region. If you do, you will likely throw away many reads. 
+```{r}
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs, maxN = 0, maxEE = c(2, 2), 
+    truncQ = 10, minLen = 50, rm.phix = TRUE, compress = TRUE, multithread = TRUE)  # on windows, set multithread = FALSE
+head(out)
+```
+Next, we learn the errors present in our samples and plot these errors.
+```{r}
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+```
+
+Next, we dereplicate our samples and then infer our sample composition based upon the errors we learned. DADA2 'fixes' errors in this step leaving us with a best guess of the true underlying proportions. 
+```{r}
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = T)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = T)
+```
+
+Merge your forward and reverse reads. 
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+Make a sequence table (OTU table) and remove chimeric sequences. The last line gives us a distribution of read lengths from our sequence table. I chose not to remove samples based on length here due to the variabilty. 
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+table(nchar(getSequences(seqtab.nochim)))
+```
+
+Assign taxonomy based with desired database. 
+```{r}
+tax.ref <- ""  # CHANGE ME to location on your machine
+taxa <- assignTaxonomy(seqtab.nochim, tax.ref, multithread = TRUE, tryRC = TRUE)
+```
+
+
