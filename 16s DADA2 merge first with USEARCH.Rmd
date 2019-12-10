@@ -1,0 +1,73 @@
+---
+title: "16S Dada2 merge first approach for poor quality reads"
+subtitle: "Written by Gordon Custer "
+output: html_notebook
+---
+
+In cases with poor quality reads (2x300 MiSEQ) you might want to use a merge first approach and then analyze your reads as if you only had forward reads from there on. Below is my standard pipeline for doing so.
+
+First you will merge your reads using USEARCH. Please make sure this is installed on your computer. Please use script Merge.sh (also found in this repository).
+
+Set up environment and pathways for processing.
+```{r}
+path <- "" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+fnFs <- sort(list.files(path, pattern=".fq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+filtFs <- file.path(path, "filtered", paste0(sample.names, "filt.fastq"))
+filtFs
+```
+
+Filter and trim to remove N's. You can also increase the stringency of the trunQ argument and add maxEE to make filtering more strict. 
+```{r}
+out <- filterAndTrim(fnFs, filtFs,
+              maxN=0, , truncQ=0, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+colSums(out)
+head(out)
+```
+
+Learn the distribution of errors in your dataset. 
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+Plot the errors.
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+Dereplicate your files. Next, the dada step infers the sample composition by 'fixing' errors. 
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+names(derepFs) <- sample.names
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+```
+
+Make sequence table (OTU table) and remove chimeric sequences. The last line provides a table of the distribution of sequence lengths from your sequence table. 
+```{r}
+seqtab <- makeSequenceTable(dadaFs)
+dim(seqtab)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+table(nchar(getSequences(seqtab.nochim)))
+```
+
+Remove short reads. Use the output from above to chose minimum length reads to retain. 
+```{r}
+seqtab.nochim_filt<-seqtab.nochim[,nchar(colnames(seqtab.nochim))>=200 ]
+table(nchar(getSequences(seqtab.nochim_filt)))
+dim(seqtab.nochim_filt)
+```
+
+This provides a summary table of the number of sequences retained through the processing pipeline. 
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN),rowSums(seqtab.nochim), rowSums(seqtab.nochim_filt))
+# If processing a single sample, remove the sapply calls: e.g. replace
+# sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("Total input", "Post-filtering", "Denoised Forwards", "Pre-Filtering Forwards",
+    "Forwards > 200bp")
+rownames(track) <- sample.names
+#head(track)
+colSums(track)
+```
